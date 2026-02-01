@@ -28,6 +28,7 @@ DECAY_THRESHOLD_SESSIONS = 7  # Sessions without recall before compression candi
 EMOTIONAL_WEIGHT_THRESHOLD = 0.6  # Above this resists decay
 RECALL_COUNT_THRESHOLD = 5  # Above this resists decay
 COOCCURRENCE_LINK_THRESHOLD = 3  # Times memories must co-occur to auto-link
+PAIR_DECAY_RATE = 0.5  # How much co-occurrence counts decay per session if not reinforced
 
 # Session-level tracking for co-occurrence
 _session_recalls: list[str] = []  # Memory IDs recalled this session
@@ -432,6 +433,56 @@ def get_cooccurrence_stats() -> dict:
     }
 
 
+def decay_pair_cooccurrences() -> tuple[int, int]:
+    """
+    Apply soft decay to co-occurrence pairs that weren't reinforced this session.
+    Call AFTER end_session_cooccurrence() at session end.
+
+    Pairs that co-occurred this session: no decay (already got +1)
+    Pairs that didn't co-occur: decay by PAIR_DECAY_RATE (default 0.5)
+    Pairs that hit 0 or below: pruned
+
+    This prevents unbounded growth of co-occurrence data over time.
+    Developed in collaboration with DriftCornwall (github.com/driftcornwall/drift-memory).
+
+    Returns: (pairs_decayed, pairs_pruned)
+    """
+    global _session_recalls
+
+    # Build set of pairs that were reinforced this session
+    reinforced_pairs = set()
+    for i, id1 in enumerate(_session_recalls):
+        for id2 in _session_recalls[i+1:]:
+            reinforced_pairs.add(tuple(sorted([id1, id2])))
+
+    # Load current counts
+    counts = _load_cooccurrence_counts()
+
+    pairs_decayed = 0
+    pairs_pruned = 0
+    to_remove = []
+
+    for pair, count in counts.items():
+        if pair not in reinforced_pairs:
+            new_count = count - PAIR_DECAY_RATE
+            if new_count <= 0:
+                to_remove.append(pair)
+                pairs_pruned += 1
+            else:
+                counts[pair] = new_count
+                pairs_decayed += 1
+
+    # Remove pruned pairs
+    for pair in to_remove:
+        del counts[pair]
+
+    # Save updated counts
+    _save_cooccurrence_counts(counts)
+
+    print(f"Pair decay: {pairs_decayed} decayed, {pairs_pruned} pruned")
+    return pairs_decayed, pairs_pruned
+
+
 # CLI interface
 if __name__ == "__main__":
     import sys
@@ -445,7 +496,8 @@ if __name__ == "__main__":
         print("  recall <id>     - Recall a memory by ID")
         print("  related <id>    - Find related memories")
         print("  cooccur         - Show co-occurrence statistics")
-        print("  end-session     - Process co-occurrences and create auto-links")
+        print("  end-session     - Process co-occurrences, apply decay, and create auto-links")
+        print("  decay-pairs     - Apply pair decay only (without logging new co-occurrences)")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -495,7 +547,10 @@ if __name__ == "__main__":
                 print(f"    {pair[0]} <-> {pair[1]}: {count} co-occurrences")
     elif cmd == "end-session":
         new_links = end_session_cooccurrence()
+        decayed, pruned = decay_pair_cooccurrences()
         if new_links:
             print(f"Created {len(new_links)} new automatic links")
-        else:
-            print("No new links created this session")
+        print(f"Session ended. {decayed} pairs decayed, {pruned} pairs pruned.")
+    elif cmd == "decay-pairs":
+        decayed, pruned = decay_pair_cooccurrences()
+        print(f"Decay complete: {decayed} pairs decayed, {pruned} pairs pruned")
