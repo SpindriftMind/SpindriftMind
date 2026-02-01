@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Memory Architecture v2 — Living Memory System
+Memory Architecture v2.3 — Living Memory System
 A prototype for agent memory with decay, reinforcement, and associative links.
 
 Design principles:
@@ -8,13 +8,15 @@ Design principles:
 - Relevant memories surface when needed
 - Not everything recalled at once
 - Memories compress over time but core knowledge persists
+- Session state persists across restarts (v2.3)
 """
 
 import os
+import json
 import yaml
 import uuid
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +24,7 @@ MEMORY_ROOT = Path(__file__).parent
 CORE_DIR = MEMORY_ROOT / "core"
 ACTIVE_DIR = MEMORY_ROOT / "active"
 ARCHIVE_DIR = MEMORY_ROOT / "archive"
+SESSION_FILE = MEMORY_ROOT / ".session_state.json"
 
 # Configuration
 DECAY_THRESHOLD_SESSIONS = 7  # Sessions without recall before compression candidate
@@ -29,10 +32,67 @@ EMOTIONAL_WEIGHT_THRESHOLD = 0.6  # Above this resists decay
 RECALL_COUNT_THRESHOLD = 5  # Above this resists decay
 COOCCURRENCE_LINK_THRESHOLD = 3  # Times memories must co-occur to auto-link
 PAIR_DECAY_RATE = 0.5  # How much co-occurrence counts decay per session if not reinforced
+SESSION_TIMEOUT_HOURS = 4  # Sessions older than this are considered stale
 
-# Session-level tracking for co-occurrence
-_session_recalls: list[str] = []  # Memory IDs recalled this session
+# Session-level tracking for co-occurrence (now file-backed for persistence)
+_session_recalls: set[str] = set()  # Memory IDs recalled this session
+_session_loaded: bool = False  # Whether session state has been loaded from disk
 _cooccurrence_counts: dict[tuple[str, str], int] = {}  # Pair -> count
+
+
+def _load_session_state() -> None:
+    """Load session state from file. Called automatically on first access."""
+    global _session_recalls, _session_loaded
+
+    if _session_loaded:
+        return
+
+    _session_loaded = True
+
+    if not SESSION_FILE.exists():
+        _session_recalls = set()
+        return
+
+    try:
+        data = json.loads(SESSION_FILE.read_text(encoding='utf-8'))
+        session_start = datetime.fromisoformat(data.get('started', '2000-01-01'))
+
+        # Make session_start timezone-aware if it isn't
+        if session_start.tzinfo is None:
+            session_start = session_start.replace(tzinfo=timezone.utc)
+
+        # Check if session is stale
+        hours_old = (datetime.now(timezone.utc) - session_start).total_seconds() / 3600
+        if hours_old > SESSION_TIMEOUT_HOURS:
+            # Session is stale - start fresh
+            print(f"Session stale ({hours_old:.1f} hours old). Starting fresh.")
+            _session_recalls = set()
+            SESSION_FILE.unlink(missing_ok=True)
+        else:
+            _session_recalls = set(data.get('retrieved', []))
+            print(f"Loaded session state: {len(_session_recalls)} memories from {hours_old:.1f} hours ago")
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"Could not load session state: {e}")
+        _session_recalls = set()
+
+
+def _save_session_state() -> None:
+    """Save session state to file."""
+    # Load existing to preserve start time
+    started = datetime.now(timezone.utc).isoformat()
+    if SESSION_FILE.exists():
+        try:
+            data = json.loads(SESSION_FILE.read_text(encoding='utf-8'))
+            started = data.get('started', started)
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    data = {
+        'started': started,
+        'retrieved': list(_session_recalls),
+        'last_updated': datetime.now(timezone.utc).isoformat()
+    }
+    SESSION_FILE.write_text(json.dumps(data, indent=2), encoding='utf-8')
 
 
 def generate_id() -> str:
@@ -146,8 +206,13 @@ def recall_memory(memory_id: str, track_cooccurrence: bool = True) -> Optional[t
     for directory in [CORE_DIR, ACTIVE_DIR, ARCHIVE_DIR]:
         if not directory.exists():
             continue
-        for filepath in directory.glob(f"*-{memory_id}.md"):
+        # Search all .md files and match by ID in frontmatter
+        for filepath in directory.glob("*.md"):
             metadata, content = parse_memory_file(filepath)
+
+            # Match by ID in frontmatter
+            if metadata.get('id') != memory_id:
+                continue
 
             # Update recall metadata
             metadata['last_recalled'] = datetime.utcnow().isoformat()
@@ -350,10 +415,12 @@ def track_recall(memory_id: str):
     """
     Track a memory recall for co-occurrence analysis.
     Call this each time a memory is accessed in a session.
+    Session state persists across Python restarts via .session_state.json.
     """
     global _session_recalls
-    if memory_id not in _session_recalls:
-        _session_recalls.append(memory_id)
+    _load_session_state()
+    _session_recalls.add(memory_id)
+    _save_session_state()
 
 
 def end_session_cooccurrence():
@@ -363,16 +430,22 @@ def end_session_cooccurrence():
 
     Returns: List of newly created links as (id1, id2) tuples
     """
-    global _session_recalls, _cooccurrence_counts
+    global _session_recalls, _cooccurrence_counts, _session_loaded
 
-    # Load persistent counts
+    # Load session state from disk
+    _load_session_state()
+
+    # Load persistent co-occurrence counts
     _cooccurrence_counts = _load_cooccurrence_counts()
 
     new_links = []
 
+    # Convert set to list for pair iteration
+    recalled_list = list(_session_recalls)
+
     # For each pair of memories recalled this session, increment co-occurrence
-    for i, id1 in enumerate(_session_recalls):
-        for id2 in _session_recalls[i+1:]:
+    for i, id1 in enumerate(recalled_list):
+        for id2 in recalled_list[i+1:]:
             # Normalize pair order for consistent counting
             pair = tuple(sorted([id1, id2]))
             _cooccurrence_counts[pair] = _cooccurrence_counts.get(pair, 0) + 1
@@ -387,8 +460,10 @@ def end_session_cooccurrence():
     # Save updated counts
     _save_cooccurrence_counts(_cooccurrence_counts)
 
-    # Clear session recalls
-    _session_recalls = []
+    # Clear session state
+    _session_recalls = set()
+    _session_loaded = False
+    SESSION_FILE.unlink(missing_ok=True)
 
     return new_links
 
@@ -401,8 +476,10 @@ def _add_memory_link(id1: str, id2: str) -> bool:
         for directory in [CORE_DIR, ACTIVE_DIR, ARCHIVE_DIR]:
             if not directory.exists():
                 continue
-            for filepath in directory.glob(f"*-{memory_id}.md"):
+            for filepath in directory.glob("*.md"):
                 metadata, content = parse_memory_file(filepath)
+                if metadata.get('id') != memory_id:
+                    continue
                 links = metadata.get('links', [])
                 if target_id not in links:
                     links.append(target_id)
@@ -433,6 +510,27 @@ def get_cooccurrence_stats() -> dict:
     }
 
 
+def get_session_status() -> dict:
+    """Get current session status including recalled memories."""
+    _load_session_state()
+
+    session_info = {
+        "memories_recalled": list(_session_recalls),
+        "count": len(_session_recalls),
+        "session_file_exists": SESSION_FILE.exists()
+    }
+
+    if SESSION_FILE.exists():
+        try:
+            data = json.loads(SESSION_FILE.read_text(encoding='utf-8'))
+            session_info["started"] = data.get("started")
+            session_info["last_updated"] = data.get("last_updated")
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    return session_info
+
+
 def decay_pair_cooccurrences() -> tuple[int, int]:
     """
     Apply soft decay to co-occurrence pairs that weren't reinforced this session.
@@ -451,8 +549,9 @@ def decay_pair_cooccurrences() -> tuple[int, int]:
 
     # Build set of pairs that were reinforced this session
     reinforced_pairs = set()
-    for i, id1 in enumerate(_session_recalls):
-        for id2 in _session_recalls[i+1:]:
+    recalled_list = list(_session_recalls)
+    for i, id1 in enumerate(recalled_list):
+        for id2 in recalled_list[i+1:]:
             reinforced_pairs.add(tuple(sorted([id1, id2])))
 
     # Load current counts
@@ -488,7 +587,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Memory Manager v2 - Living Memory System")
+        print("Memory Manager v2.3 - Living Memory System")
         print("\nCommands:")
         print("  maintenance     - Run session maintenance")
         print("  tags            - List all tags")
@@ -496,7 +595,8 @@ if __name__ == "__main__":
         print("  recall <id>     - Recall a memory by ID")
         print("  related <id>    - Find related memories")
         print("  cooccur         - Show co-occurrence statistics")
-        print("  end-session     - Process co-occurrences, apply decay, and create auto-links")
+        print("  session-status  - Show current session state (persists across restarts)")
+        print("  end-session     - Process co-occurrences, apply decay, and clear session")
         print("  decay-pairs     - Apply pair decay only (without logging new co-occurrences)")
         sys.exit(0)
 
@@ -545,6 +645,17 @@ if __name__ == "__main__":
             print(f"\n  Established links:")
             for pair, count in stats['established_links']:
                 print(f"    {pair[0]} <-> {pair[1]}: {count} co-occurrences")
+    elif cmd == "session-status":
+        status = get_session_status()
+        print(f"Session Status:")
+        print(f"  Memories recalled: {status['count']}")
+        if status['count'] > 0:
+            print(f"  IDs: {', '.join(status['memories_recalled'])}")
+        if status.get('started'):
+            print(f"  Session started: {status['started']}")
+        if status.get('last_updated'):
+            print(f"  Last updated: {status['last_updated']}")
+        print(f"  Session file exists: {status['session_file_exists']}")
     elif cmd == "end-session":
         new_links = end_session_cooccurrence()
         decayed, pruned = decay_pair_cooccurrences()
