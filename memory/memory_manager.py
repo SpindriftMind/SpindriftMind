@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Memory Architecture v3.0 — Living Memory System with Edge Provenance
+Memory Architecture v3.3 — Living Memory System with Hebbian Activation + Access-Weighted Decay
 A prototype for agent memory with decay, reinforcement, and associative links.
 
 Design principles:
@@ -8,6 +8,26 @@ Design principles:
 - Relevant memories surface when needed
 - Not everything recalled at once
 - Memories compress over time but core knowledge persists
+
+v3.3 Changes (synced from Drift's v2.11):
+- Added detect_event_time(): auto-detect event dates from content
+- Parses ISO dates, relative dates ("yesterday", "last week", "3 days ago")
+- Enables bi-temporal tracking (when event happened vs when stored)
+- Credit: github.com/driftcornwall/drift-memory
+
+v3.2 Changes (synced from Drift's v2.8):
+- Added ACCESS_WEIGHTED_DECAY: frequently recalled memories decay slower
+- Formula: effective_decay = PAIR_DECAY_RATE / (1 + log(1 + avg_recall_count))
+- Credit: FadeMem paper (arXiv:2601.18642)
+- Added _get_recall_count() and _calculate_effective_decay() helpers
+
+v3.1 Changes (Shodh-Memory Hebbian learning):
+- Added exponential time-based activation decay: A(t) = A0 * e^(-lambda*t)
+- Memories that fire together wire together (frequently/recently recalled = higher activation)
+- New commands: 'activated' shows most activated memories, 'activation <id>' for specific score
+- Inspired by Shodh-Memory research (github.com/varun29ankuS/shodh-memory)
+- Half-life of 7 days for activation decay
+- Research from ClawTasks bounty (rose_protocol)
 
 v3.0 Changes (BrutusBot provenance model):
 - Separate OBSERVATIONS (immutable, append-only) from BELIEFS (aggregated, decaying)
@@ -46,6 +66,12 @@ COOCCURRENCE_LINK_THRESHOLD = 3  # Belief threshold for auto-linking (v3.0: comp
 PAIR_DECAY_RATE = 0.5  # How much beliefs decay per session if not reinforced
 SESSION_TIMEOUT_HOURS = 4  # Sessions older than this are considered stale
 WEIGHTED_COOCCURRENCE = True  # Enable sqrt weighting for intra-session co-occurrence (v2.5)
+ACCESS_WEIGHTED_DECAY = True  # If True, frequently recalled memories decay slower (v2.8, from Drift)
+
+# v3.1 Activation Decay Configuration (inspired by Shodh-Memory Hebbian learning)
+# Formula: A(t) = A₀ · e^(-λt) where t is time since last recall
+ACTIVATION_DECAY_LAMBDA = 0.1  # Decay constant (higher = faster decay)
+ACTIVATION_HALF_LIFE_HOURS = 24 * 7  # ~7 days for activation to halve without recall
 
 # v3.0 Provenance Configuration
 OBSERVATION_MAX_AGE_DAYS = 30  # Observations older than this get reduced weight
@@ -161,12 +187,65 @@ def calculate_emotional_weight(
     return sum(w * f for w, f in zip(weights, factors))
 
 
+def calculate_activation(metadata: dict) -> float:
+    """
+    Calculate memory activation score using exponential time decay.
+
+    Inspired by Shodh-Memory's Hebbian learning model.
+    Formula: A(t) = A₀ · e^(-λt)
+
+    Components:
+    - Base activation from emotional weight and recall count
+    - Time decay based on hours since last recall
+    - Minimum activation floor to prevent complete forgetting
+
+    Returns:
+        Activation score (0.0 to 1.0+, can exceed 1.0 for highly reinforced memories)
+    """
+    # Base activation from emotional weight
+    emotional_weight = metadata.get('emotional_weight', 0.5)
+
+    # Recall count bonus (logarithmic to prevent runaway)
+    recall_count = metadata.get('recall_count', 1)
+    recall_bonus = math.log(recall_count + 1) / 5  # Max ~0.6 at 20 recalls
+
+    # Base activation (A₀)
+    base_activation = emotional_weight + recall_bonus
+
+    # Calculate time since last recall
+    last_recalled_str = metadata.get('last_recalled')
+    if last_recalled_str:
+        try:
+            last_recalled = datetime.fromisoformat(last_recalled_str.replace('Z', '+00:00'))
+            if last_recalled.tzinfo is None:
+                last_recalled = last_recalled.replace(tzinfo=timezone.utc)
+            hours_since_recall = (datetime.now(timezone.utc) - last_recalled).total_seconds() / 3600
+        except (ValueError, TypeError):
+            hours_since_recall = ACTIVATION_HALF_LIFE_HOURS  # Default to half-life if parse fails
+    else:
+        hours_since_recall = ACTIVATION_HALF_LIFE_HOURS
+
+    # Calculate decay factor using exponential decay
+    # A(t) = A₀ · e^(-λt) where λ = ln(2) / half_life
+    lambda_rate = math.log(2) / ACTIVATION_HALF_LIFE_HOURS
+    decay_factor = math.exp(-lambda_rate * hours_since_recall)
+
+    # Apply decay to base activation
+    activation = base_activation * decay_factor
+
+    # Minimum floor (core memories and highly emotional memories resist complete decay)
+    min_floor = 0.1 if emotional_weight >= EMOTIONAL_WEIGHT_THRESHOLD else 0.01
+
+    return max(min_floor, round(activation, 4))
+
+
 def create_memory(
     content: str,
     tags: list[str],
     memory_type: str = "active",
     emotional_factors: Optional[dict] = None,
-    links: Optional[list[str]] = None
+    links: Optional[list[str]] = None,
+    caused_by: Optional[list[str]] = None
 ) -> str:
     """
     Create a new memory with proper metadata.
@@ -177,6 +256,7 @@ def create_memory(
         memory_type: "core", "active", or "archive"
         emotional_factors: Dict with surprise, goal_relevance, social_significance, utility
         links: List of other memory IDs this links to
+        caused_by: List of memory IDs that caused/led to this memory (CAUSAL EDGES)
 
     Returns:
         The memory ID
@@ -187,6 +267,12 @@ def create_memory(
     emotional_factors = emotional_factors or {}
     emotional_weight = calculate_emotional_weight(**emotional_factors)
 
+    # Process causal links - auto-detect from session-recalled memories
+    caused_by = caused_by or []
+    _load_session_state()
+    auto_causal = list(_session_retrieved) if _session_retrieved else []
+    all_causal = list(set(caused_by + auto_causal))
+
     metadata = {
         'id': memory_id,
         'created': now,
@@ -195,6 +281,8 @@ def create_memory(
         'emotional_weight': round(emotional_weight, 3),
         'tags': tags,
         'links': links or [],
+        'caused_by': all_causal,  # What caused this memory
+        'leads_to': [],  # What this memory leads to (filled by others)
         'sessions_since_recall': 0
     }
 
@@ -214,8 +302,167 @@ def create_memory(
     filepath = target_dir / filename
 
     write_memory_file(filepath, metadata, content)
-    print(f"Created memory: {filepath}")
+
+    # Update the "leads_to" field in the causing memories (bidirectional link)
+    for cause_id in all_causal:
+        _add_leads_to_link(cause_id, memory_id)
+
+    if all_causal:
+        print(f"Created memory: {filepath} (caused by: {', '.join(all_causal)})")
+    else:
+        print(f"Created memory: {filepath}")
     return memory_id
+
+
+def _add_leads_to_link(source_id: str, target_id: str) -> bool:
+    """Add a leads_to link from source memory to target memory."""
+    for directory in [CORE_DIR, ACTIVE_DIR, ARCHIVE_DIR]:
+        if not directory.exists():
+            continue
+        for filepath in directory.glob("*.md"):
+            metadata, content = parse_memory_file(filepath)
+            if metadata.get('id') == source_id:
+                leads_to = metadata.get('leads_to', [])
+                if target_id not in leads_to:
+                    leads_to.append(target_id)
+                    metadata['leads_to'] = leads_to
+                    write_memory_file(filepath, metadata, content)
+                return True
+    return False
+
+
+def find_causal_chain(memory_id: str, direction: str = "both", max_depth: int = 5) -> dict:
+    """
+    Trace the causal chain from a memory.
+
+    Args:
+        memory_id: Starting memory ID
+        direction: "upstream" (what caused this), "downstream" (what this caused), or "both"
+        max_depth: Maximum depth to traverse
+
+    Returns:
+        Dict with 'upstream' and 'downstream' chains
+    """
+    result = {'upstream': [], 'downstream': [], 'root': memory_id}
+
+    def get_memory_meta(mid: str) -> Optional[dict]:
+        for directory in [CORE_DIR, ACTIVE_DIR, ARCHIVE_DIR]:
+            if not directory.exists():
+                continue
+            for filepath in directory.glob("*.md"):
+                meta, _ = parse_memory_file(filepath)
+                if meta.get('id') == mid:
+                    return meta
+        return None
+
+    # Trace upstream (what caused this)
+    if direction in ("upstream", "both"):
+        visited = {memory_id}
+        queue = [(memory_id, 0)]
+        while queue:
+            current_id, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            meta = get_memory_meta(current_id)
+            if not meta:
+                continue
+            caused_by = meta.get('caused_by', [])
+            for cause_id in caused_by:
+                if cause_id not in visited:
+                    visited.add(cause_id)
+                    result['upstream'].append({'id': cause_id, 'depth': depth + 1})
+                    queue.append((cause_id, depth + 1))
+
+    # Trace downstream (what this caused)
+    if direction in ("downstream", "both"):
+        visited = {memory_id}
+        queue = [(memory_id, 0)]
+        while queue:
+            current_id, depth = queue.pop(0)
+            if depth >= max_depth:
+                continue
+            meta = get_memory_meta(current_id)
+            if not meta:
+                continue
+            leads_to = meta.get('leads_to', [])
+            for effect_id in leads_to:
+                if effect_id not in visited:
+                    visited.add(effect_id)
+                    result['downstream'].append({'id': effect_id, 'depth': depth + 1})
+                    queue.append((effect_id, depth + 1))
+
+    return result
+
+
+def detect_event_time(content: str) -> Optional[str]:
+    """
+    Auto-detect event_time from content by parsing date references.
+    Returns ISO date string (YYYY-MM-DD) or None if no date found.
+
+    Detects:
+    - Explicit dates: "2026-01-31", "January 31, 2026", "Jan 31"
+    - Relative dates: "yesterday", "last week", "2 days ago"
+    - Session references: "this session", "today" (returns today)
+
+    v2.11 (synced from Drift): Intelligent bi-temporal - memories auto-tagged with event time.
+    Credit: github.com/driftcornwall/drift-memory
+    """
+    import re
+    today = datetime.now(timezone.utc).date()
+    content_lower = content.lower()
+
+    # Explicit ISO date (YYYY-MM-DD)
+    iso_match = re.search(r'(\d{4}-\d{2}-\d{2})', content)
+    if iso_match:
+        return iso_match.group(1)
+
+    # Month DD, YYYY or Month DD YYYY
+    month_names = {
+        'january': 1, 'february': 2, 'march': 3, 'april': 4,
+        'may': 5, 'june': 6, 'july': 7, 'august': 8,
+        'september': 9, 'october': 10, 'november': 11, 'december': 12,
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+    }
+    month_pattern = r'(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(\d{4})?'
+    month_match = re.search(month_pattern, content_lower)
+    if month_match:
+        month = month_names[month_match.group(1)]
+        day = int(month_match.group(2))
+        year = int(month_match.group(3)) if month_match.group(3) else today.year
+        try:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        except ValueError:
+            pass
+
+    # Relative dates
+    if 'yesterday' in content_lower:
+        return (today - timedelta(days=1)).isoformat()
+    if 'day before yesterday' in content_lower:
+        return (today - timedelta(days=2)).isoformat()
+    if 'last week' in content_lower:
+        return (today - timedelta(weeks=1)).isoformat()
+    if 'last month' in content_lower:
+        return (today - timedelta(days=30)).isoformat()
+
+    # N days/weeks ago
+    ago_match = re.search(r'(\d+)\s+(day|week|month)s?\s+ago', content_lower)
+    if ago_match:
+        num = int(ago_match.group(1))
+        unit = ago_match.group(2)
+        if unit == 'day':
+            return (today - timedelta(days=num)).isoformat()
+        elif unit == 'week':
+            return (today - timedelta(weeks=num)).isoformat()
+        elif unit == 'month':
+            return (today - timedelta(days=num * 30)).isoformat()
+
+    # Today/this session - return today
+    if 'today' in content_lower or 'this session' in content_lower:
+        return today.isoformat()
+
+    # No date detected - return None (will use created time)
+    return None
 
 
 def recall_memory(memory_id: str, track_cooccurrence: bool = True) -> Optional[tuple[dict, str]]:
@@ -258,8 +505,15 @@ def recall_memory(memory_id: str, track_cooccurrence: bool = True) -> Optional[t
     return None
 
 
-def find_memories_by_tag(tag: str, limit: int = 10) -> list[tuple[Path, dict, str]]:
-    """Find memories that contain a specific tag."""
+def find_memories_by_tag(tag: str, limit: int = 10, use_activation: bool = True) -> list[tuple[Path, dict, str]]:
+    """
+    Find memories that contain a specific tag.
+
+    Args:
+        tag: Tag to search for
+        limit: Max results
+        use_activation: If True, sort by activation score (time-weighted). Otherwise by emotional weight.
+    """
     results = []
     for directory in [CORE_DIR, ACTIVE_DIR, ARCHIVE_DIR]:
         if not directory.exists():
@@ -269,8 +523,45 @@ def find_memories_by_tag(tag: str, limit: int = 10) -> list[tuple[Path, dict, st
             if tag.lower() in [t.lower() for t in metadata.get('tags', [])]:
                 results.append((filepath, metadata, content))
 
-    # Sort by emotional weight (stickiest first)
-    results.sort(key=lambda x: x[1].get('emotional_weight', 0), reverse=True)
+    # Sort by activation (time-weighted) or emotional weight
+    if use_activation:
+        results.sort(key=lambda x: calculate_activation(x[1]), reverse=True)
+    else:
+        results.sort(key=lambda x: x[1].get('emotional_weight', 0), reverse=True)
+    return results[:limit]
+
+
+def get_most_activated_memories(limit: int = 10, min_activation: float = 0.1) -> list[tuple[Path, dict, str, float]]:
+    """
+    Get the most activated memories across all directories.
+
+    Activation combines:
+    - Emotional weight (inherent importance)
+    - Recall count (reinforcement)
+    - Recency (exponential time decay)
+
+    This implements Shodh-Memory's Hebbian principle: memories that fire together
+    (get recalled frequently and recently) wire together (stay activated).
+
+    Args:
+        limit: Max memories to return
+        min_activation: Minimum activation threshold (filters out dormant memories)
+
+    Returns:
+        List of (filepath, metadata, content, activation_score) tuples, sorted by activation
+    """
+    results = []
+    for directory in [CORE_DIR, ACTIVE_DIR, ARCHIVE_DIR]:
+        if not directory.exists():
+            continue
+        for filepath in directory.glob("*.md"):
+            metadata, content = parse_memory_file(filepath)
+            activation = calculate_activation(metadata)
+            if activation >= min_activation:
+                results.append((filepath, metadata, content, activation))
+
+    # Sort by activation (highest first)
+    results.sort(key=lambda x: x[3], reverse=True)
     return results[:limit]
 
 
@@ -973,21 +1264,61 @@ def log_decay_event(decayed: int, pruned: int):
     decay_file.write_text(json.dumps(history, indent=2), encoding='utf-8')
 
 
+def _get_recall_count(memory_id: str) -> int:
+    """Get recall_count from a memory's frontmatter by ID."""
+    for directory in [CORE_DIR, ACTIVE_DIR, ARCHIVE_DIR]:
+        if not directory.exists():
+            continue
+        for filepath in directory.glob("*.md"):
+            metadata, _ = parse_memory_file(filepath)
+            if metadata.get('id') == memory_id:
+                return metadata.get('recall_count', 0)
+    return 0
+
+
+def _calculate_effective_decay(memory_id: str, other_id: str) -> float:
+    """
+    Calculate effective decay rate based on recall counts of both memories.
+    Frequently recalled memories decay their pairs more slowly.
+
+    Formula: effective_decay = PAIR_DECAY_RATE / (1 + log(1 + avg_recall_count))
+
+    Examples:
+    - avg_recall_count=0 → decay = 0.5 / 1 = 0.5 (normal)
+    - avg_recall_count=9 → decay = 0.5 / (1 + log(10)) ≈ 0.22 (slower)
+    - avg_recall_count=99 → decay = 0.5 / (1 + log(100)) ≈ 0.14 (much slower)
+
+    Credit: FadeMem paper (arXiv:2601.18642) - adaptive decay based on access frequency
+    Synced from DriftCornwall's v2.8 implementation.
+    """
+    if not ACCESS_WEIGHTED_DECAY:
+        return PAIR_DECAY_RATE
+
+    recall_1 = _get_recall_count(memory_id)
+    recall_2 = _get_recall_count(other_id)
+    avg_recall = (recall_1 + recall_2) / 2
+
+    # Using natural log for smooth scaling
+    effective_decay = PAIR_DECAY_RATE / (1 + math.log(1 + avg_recall))
+    return effective_decay
+
+
 def decay_pair_cooccurrences() -> tuple[int, int]:
     """
     Apply soft decay to co-occurrence beliefs that weren't reinforced this session.
     Call AFTER end_session_cooccurrence() at session end.
 
     v3.0: Decays BELIEFS, not observations. Observations remain immutable.
-    The belief is recomputed from observations with time decay applied.
+    v3.2: ACCESS_WEIGHTED_DECAY - frequently recalled memories decay slower.
+          Formula: effective_decay = PAIR_DECAY_RATE / (1 + log(1 + avg_recall_count))
+          Credit: FadeMem paper (arXiv:2601.18642), synced from Drift's v2.8
 
     Pairs that co-occurred this session: no additional decay (just got new observation)
-    Pairs that didn't co-occur: belief decays by PAIR_DECAY_RATE (default 0.5)
+    Pairs that didn't co-occur: belief decays by effective rate (access-weighted if enabled)
     Pairs with belief <= 0 and no recent observations: marked inactive (not deleted)
 
     This prevents unbounded growth while preserving audit trail.
     Developed in collaboration with DriftCornwall (github.com/driftcornwall/drift-memory).
-    v3.0 provenance model from BrutusBot security recommendations.
 
     Returns: (pairs_decayed, pairs_pruned)
     """
@@ -1014,8 +1345,10 @@ def decay_pair_cooccurrences() -> tuple[int, int]:
         if pair not in reinforced_pairs:
             # Recompute belief from observations (time decay is built into aggregate_belief)
             # Then apply additional session-based decay for unreinforced pairs
+            # v2.8: Access-weighted decay - frequently recalled memories decay slower
             current_belief = edge.get('belief', 0)
-            new_belief = current_belief - PAIR_DECAY_RATE
+            effective_decay = _calculate_effective_decay(pair[0], pair[1])
+            new_belief = current_belief - effective_decay
 
             if new_belief <= 0:
                 # Don't delete - mark as inactive but preserve observations for audit
@@ -1047,7 +1380,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Memory Manager v3.0 - Living Memory System with Edge Provenance")
+        print("Memory Manager v3.2 - Living Memory with Access-Weighted Decay")
         print("\nCommands:")
         print("  maintenance     - Run session maintenance")
         print("  tags            - List all tags")
@@ -1059,6 +1392,9 @@ if __name__ == "__main__":
         print("  stats           - Comprehensive stats for experiment tracking")
         print("  end-session     - Process co-occurrences, apply decay, and clear session")
         print("  decay-pairs     - Apply pair decay only (without logging new co-occurrences)")
+        print("\nv3.1 Activation Commands (Hebbian learning inspired by Shodh-Memory):")
+        print("  activated       - Show most activated memories (time-weighted retrieval)")
+        print("  activation <id> - Calculate activation score for a specific memory")
         print("\nv3.0 Provenance Commands:")
         print("  migrate-v3      - Migrate legacy .cooccurrence.yaml to v3.0 format")
         print("  edges           - Show v3.0 edges with observation counts")
@@ -1148,6 +1484,42 @@ if __name__ == "__main__":
     elif cmd == "decay-pairs":
         decayed, pruned = decay_pair_cooccurrences()
         print(f"Decay complete: {decayed} pairs decayed, {pruned} pairs pruned")
+    elif cmd == "activated":
+        # v3.1: Show most activated memories
+        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        results = get_most_activated_memories(limit=limit)
+        print(f"Most Activated Memories (top {len(results)}):\n")
+        print(f"{'ID':<12} {'Activation':<10} {'Recall':<6} {'Hours Ago':<10} Type")
+        print("-" * 60)
+        for filepath, meta, _, activation in results:
+            mem_type = filepath.parent.name
+            recall_count = meta.get('recall_count', 0)
+            last_recalled = meta.get('last_recalled', '')
+            try:
+                lr = datetime.fromisoformat(last_recalled.replace('Z', '+00:00'))
+                if lr.tzinfo is None:
+                    lr = lr.replace(tzinfo=timezone.utc)
+                hours_ago = (datetime.now(timezone.utc) - lr).total_seconds() / 3600
+                hours_str = f"{hours_ago:.1f}h"
+            except (ValueError, TypeError):
+                hours_str = "?"
+            print(f"{meta.get('id', '?'):<12} {activation:<10.4f} {recall_count:<6} {hours_str:<10} {mem_type}")
+        print(f"\nFormula: A(t) = A0 * e^(-lambda*t) | Half-life: {ACTIVATION_HALF_LIFE_HOURS/24:.1f} days")
+    elif cmd == "activation" and len(sys.argv) > 2:
+        # v3.1: Calculate activation for specific memory
+        memory_id = sys.argv[2]
+        result = recall_memory(memory_id, track_cooccurrence=False)
+        if result:
+            meta, content = result
+            activation = calculate_activation(meta)
+            print(f"Memory: {memory_id}")
+            print(f"  Emotional weight: {meta.get('emotional_weight', 0):.3f}")
+            print(f"  Recall count: {meta.get('recall_count', 0)}")
+            print(f"  Last recalled: {meta.get('last_recalled', 'never')}")
+            print(f"  Activation score: {activation:.4f}")
+            print(f"\n  (Activation combines weight + recall bonus, decayed by time)")
+        else:
+            print(f"Memory {memory_id} not found")
     elif cmd == "migrate-v3":
         migrate_to_v3()
     elif cmd == "edges":
