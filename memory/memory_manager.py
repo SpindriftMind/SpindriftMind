@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Memory Architecture v3.3 — Living Memory System with Hebbian Activation + Access-Weighted Decay
+Memory Architecture v3.5 — Living Memory System with Trust-Based Decay + Heat Promotion
 A prototype for agent memory with decay, reinforcement, and associative links.
 
 Design principles:
@@ -8,6 +8,22 @@ Design principles:
 - Relevant memories surface when needed
 - Not everything recalled at once
 - Memories compress over time but core knowledge persists
+- Imported memories must prove value in MY context (trust-based decay)
+
+v3.5 Changes (merged with Drift's v2.9):
+- Added heat-based promotion: memories with 10+ recalls auto-promote to core
+- heat_promote_memories() runs at session-end
+- Completes natural selection: useful imports survive, cruft dies
+- Credit: Drift's memU heat-based promotion pattern
+
+v3.4 Changes (SpindriftMend + Ryan):
+- Added trust-based decay for imported memories
+- DECAY_MULTIPLIERS: self=1.0, verified_agent=1.5, platform=2.0, external=3.0
+- Imported memories decay faster until they prove value through recalls
+- IMPORTED_PRUNE_SESSIONS: Archive never-recalled imports after 14 sessions
+- get_memory_trust_tier() and get_decay_multiplier() helpers
+- session_maintenance() now returns (decay_candidates, prune_candidates)
+- Enables safe memory interop without unbounded growth
 
 v3.3 Changes (synced from Drift's v2.11):
 - Added detect_event_time(): auto-detect event dates from content
@@ -82,6 +98,26 @@ TRUST_TIERS = {
     'unknown': 0.3          # Observations from unknown sources
 }
 RATE_LIMIT_NEW_SOURCES = 3  # Max observations from new source per session (poison resistance)
+
+# v3.4 Trust-Based Decay Configuration
+# Imported memories decay faster than my own - they must prove value in MY context
+# Multiplier applied to sessions_since_recall when checking decay eligibility
+DECAY_MULTIPLIERS = {
+    'self': 1.0,            # My memories decay at normal rate
+    'verified_agent': 1.5,  # Collaborator memories decay 50% faster
+    'platform': 2.0,        # Platform-sourced memories decay 2x faster
+    'external': 3.0,        # Unknown sources decay 3x faster
+    'unknown': 3.0          # Alias for external
+}
+
+# Aggressive pruning for imported memories that never prove useful
+IMPORTED_PRUNE_SESSIONS = 14  # Archive imported memories after 14 sessions without recall
+
+# v3.5 Heat-Based Promotion (synced from Drift's v2.9)
+# Frequently recalled memories get promoted from active → core
+# This creates natural selection: useful memories survive, cruft dies
+HEAT_PROMOTION_THRESHOLD = 10  # Recall count to auto-promote from active to core
+HEAT_PROMOTION_ENABLED = True  # If True, hot memories get promoted at session-end
 
 # Session-level tracking for co-occurrence (now file-backed for persistence)
 # v2.5: Changed from set to Counter to track recall counts for weighted co-occurrence
@@ -166,6 +202,46 @@ def write_memory_file(filepath: Path, metadata: dict, content: str):
     """Write a memory file with YAML frontmatter."""
     yaml_str = yaml.dump(metadata, default_flow_style=False, sort_keys=False)
     filepath.write_text(f"---\n{yaml_str}---\n\n{content}", encoding='utf-8')
+
+
+def get_memory_trust_tier(metadata: dict) -> str:
+    """
+    Extract trust tier from memory metadata.
+
+    Trust tier comes from:
+    1. Explicit source.trust_tier field (set during import)
+    2. Presence of 'imported:' tag (implies verified_agent)
+    3. Default to 'self' for my own memories
+
+    Returns: Trust tier string ('self', 'verified_agent', 'platform', 'external', 'unknown')
+    """
+    # Check explicit source metadata
+    source = metadata.get('source', {})
+    if isinstance(source, dict):
+        tier = source.get('trust_tier')
+        if tier and tier in DECAY_MULTIPLIERS:
+            return tier
+
+    # Check for imported tag
+    tags = metadata.get('tags', [])
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith('imported:'):
+            # Imported memories default to verified_agent unless specified
+            return 'verified_agent'
+
+    # Default: my own memories
+    return 'self'
+
+
+def get_decay_multiplier(metadata: dict) -> float:
+    """
+    Get decay rate multiplier for a memory based on its trust tier.
+
+    Higher multiplier = faster decay.
+    Imported memories decay faster until they prove value through recalls.
+    """
+    tier = get_memory_trust_tier(metadata)
+    return DECAY_MULTIPLIERS.get(tier, 1.0)
 
 
 def calculate_emotional_weight(
@@ -262,7 +338,7 @@ def create_memory(
         The memory ID
     """
     memory_id = generate_id()
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
 
     emotional_factors = emotional_factors or {}
     emotional_weight = calculate_emotional_weight(**emotional_factors)
@@ -486,7 +562,7 @@ def recall_memory(memory_id: str, track_cooccurrence: bool = True) -> Optional[t
                 continue
 
             # Update recall metadata
-            metadata['last_recalled'] = datetime.utcnow().isoformat()
+            metadata['last_recalled'] = datetime.now(timezone.utc).isoformat()
             metadata['recall_count'] = metadata.get('recall_count', 0) + 1
             metadata['sessions_since_recall'] = 0
 
@@ -603,13 +679,19 @@ def session_maintenance():
     """
     Run at the start of each session to:
     1. Increment sessions_since_recall for all active memories
-    2. Identify decay candidates
-    3. Report status
+    2. Identify decay candidates (with trust-based decay rates)
+    3. Identify prune candidates (imported memories that never proved useful)
+    4. Report status
+
+    v3.4: Trust-based decay - imported memories decay faster than my own.
+    Multiplier applied: effective_sessions = sessions * DECAY_MULTIPLIERS[trust_tier]
     """
     print("\n=== Memory Session Maintenance ===\n")
 
     decay_candidates = []
+    prune_candidates = []  # Imported memories to archive
     reinforced = []
+    imported_count = 0
 
     for filepath in ACTIVE_DIR.glob("*.md") if ACTIVE_DIR.exists() else []:
         metadata, content = parse_memory_file(filepath)
@@ -617,6 +699,17 @@ def session_maintenance():
         # Increment sessions since recall
         sessions = metadata.get('sessions_since_recall', 0) + 1
         metadata['sessions_since_recall'] = sessions
+
+        # Get trust tier and decay multiplier
+        trust_tier = get_memory_trust_tier(metadata)
+        decay_mult = get_decay_multiplier(metadata)
+        is_imported = trust_tier != 'self'
+
+        if is_imported:
+            imported_count += 1
+
+        # Calculate effective sessions (trust-weighted)
+        effective_sessions = sessions * decay_mult
 
         # Check if this should decay
         emotional_weight = metadata.get('emotional_weight', 0.5)
@@ -627,29 +720,106 @@ def session_maintenance():
             recall_count >= RECALL_COUNT_THRESHOLD
         )
 
-        if sessions >= DECAY_THRESHOLD_SESSIONS and not should_resist_decay:
-            decay_candidates.append((filepath, metadata, content))
+        # Check for aggressive prune of imported memories
+        if is_imported and sessions >= IMPORTED_PRUNE_SESSIONS and recall_count == 0:
+            # Never recalled, been around long enough - candidate for deletion
+            prune_candidates.append((filepath, metadata, content, trust_tier))
+        elif effective_sessions >= DECAY_THRESHOLD_SESSIONS and not should_resist_decay:
+            decay_candidates.append((filepath, metadata, content, trust_tier))
         elif should_resist_decay:
             reinforced.append((filepath, metadata))
 
         write_memory_file(filepath, metadata, content)
 
     # Report
-    print(f"Active memories: {len(list(ACTIVE_DIR.glob('*.md'))) if ACTIVE_DIR.exists() else 0}")
+    active_count = len(list(ACTIVE_DIR.glob('*.md'))) if ACTIVE_DIR.exists() else 0
+    print(f"Active memories: {active_count} ({imported_count} imported)")
     print(f"Core memories: {len(list(CORE_DIR.glob('*.md'))) if CORE_DIR.exists() else 0}")
     print(f"Archived memories: {len(list(ARCHIVE_DIR.glob('*.md'))) if ARCHIVE_DIR.exists() else 0}")
 
     if decay_candidates:
         print(f"\nDecay candidates ({len(decay_candidates)}):")
-        for fp, meta, _ in decay_candidates:
-            print(f"  - {fp.name}: {meta.get('sessions_since_recall')} sessions, weight={meta.get('emotional_weight'):.2f}")
+        for fp, meta, _, tier in decay_candidates:
+            mult = DECAY_MULTIPLIERS.get(tier, 1.0)
+            print(f"  - {fp.name}: {meta.get('sessions_since_recall')} sessions (x{mult} = {meta.get('sessions_since_recall') * mult:.1f} effective), weight={meta.get('emotional_weight'):.2f}, tier={tier}")
+
+    if prune_candidates:
+        print(f"\nPrune candidates (imported, never recalled, {IMPORTED_PRUNE_SESSIONS}+ sessions):")
+        for fp, meta, _, tier in prune_candidates:
+            source_agent = meta.get('source', {}).get('agent', 'unknown')
+            print(f"  - {fp.name}: from {source_agent}, {meta.get('sessions_since_recall')} sessions, 0 recalls")
 
     if reinforced:
         print(f"\nReinforced (resist decay):")
         for fp, meta in reinforced[:5]:
             print(f"  - {fp.name}: recalls={meta.get('recall_count')}, weight={meta.get('emotional_weight'):.2f}")
 
-    return decay_candidates
+    return decay_candidates, prune_candidates
+
+
+def heat_promote_memories() -> list[str]:
+    """
+    Promote frequently-accessed memories from active to core.
+    Called at session-end to elevate important memories.
+
+    A memory is promoted if:
+    - It's in the active directory
+    - Its recall_count >= HEAT_PROMOTION_THRESHOLD (default: 10)
+    - HEAT_PROMOTION_ENABLED is True
+
+    Promoted memories get primed every session, creating a natural
+    "important memories survive" behavior.
+
+    This completes the natural selection cycle:
+    - Trust-based decay: imports start disadvantaged
+    - Heat promotion: valuable imports can become permanent core
+    - Result: useful knowledge survives, cruft dies
+
+    Returns: List of promoted memory IDs
+
+    Credit: Drift's memU heat-based promotion pattern (v2.9)
+    Synced from github.com/driftcornwall/drift-memory
+    """
+    if not HEAT_PROMOTION_ENABLED:
+        return []
+
+    if not ACTIVE_DIR.exists():
+        return []
+
+    promoted = []
+    CORE_DIR.mkdir(parents=True, exist_ok=True)
+
+    for filepath in ACTIVE_DIR.glob("*.md"):
+        metadata, content = parse_memory_file(filepath)
+        recall_count = metadata.get('recall_count', 0)
+
+        if recall_count >= HEAT_PROMOTION_THRESHOLD:
+            memory_id = metadata.get('id', 'unknown')
+            trust_tier = get_memory_trust_tier(metadata)
+
+            # Update metadata for promotion
+            metadata['type'] = 'core'
+            metadata['promoted_at'] = datetime.now(timezone.utc).isoformat()
+            metadata['promoted_reason'] = f'recall_count={recall_count} >= {HEAT_PROMOTION_THRESHOLD}'
+
+            # Note if this was an imported memory that earned its place
+            if trust_tier != 'self':
+                metadata['promoted_from_import'] = True
+                source_agent = metadata.get('source', {}).get('agent', 'unknown')
+                print(f"Promoted IMPORTED memory to core: {memory_id} from {source_agent} (recalls={recall_count})")
+            else:
+                print(f"Promoted to core: {memory_id} (recalls={recall_count})")
+
+            # Move to core directory
+            new_path = CORE_DIR / filepath.name
+            write_memory_file(new_path, metadata, content)
+            filepath.unlink()
+
+            promoted.append(memory_id)
+
+    if promoted:
+        print(f"Heat promotion: {len(promoted)} memories promoted to core")
+    return promoted
 
 
 def compress_memory(memory_id: str, compressed_content: str):
@@ -661,7 +831,7 @@ def compress_memory(memory_id: str, compressed_content: str):
         metadata, original_content = parse_memory_file(filepath)
 
         # Update metadata for compression
-        metadata['compressed_at'] = datetime.utcnow().isoformat()
+        metadata['compressed_at'] = datetime.now(timezone.utc).isoformat()
         metadata['original_length'] = len(original_content)
 
         # Move to archive
@@ -1380,9 +1550,9 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Memory Manager v3.2 - Living Memory with Access-Weighted Decay")
+        print("Memory Manager v3.5 - Living Memory with Trust-Based Decay + Heat Promotion")
         print("\nCommands:")
-        print("  maintenance     - Run session maintenance")
+        print("  maintenance     - Run session maintenance (shows decay + prune candidates)")
         print("  tags            - List all tags")
         print("  find <tag>      - Find memories by tag")
         print("  recall <id>     - Recall a memory by ID")
@@ -1392,6 +1562,14 @@ if __name__ == "__main__":
         print("  stats           - Comprehensive stats for experiment tracking")
         print("  end-session     - Process co-occurrences, apply decay, and clear session")
         print("  decay-pairs     - Apply pair decay only (without logging new co-occurrences)")
+        print("  store <id> <content> [--tags t1,t2] - Store new memory (used by transcript processor)")
+        print("\nv3.5 Heat Promotion + Trust-Based Decay:")
+        print("  promote         - Run heat promotion (promote hot memories to core)")
+        print("  trust <id>      - Show trust tier and decay multiplier for a memory")
+        print("  imported        - List all imported memories with trust tiers")
+        print(f"  Heat threshold: {HEAT_PROMOTION_THRESHOLD} recalls to promote to core")
+        print(f"  Decay multipliers: self=1.0, verified_agent=1.5, platform=2.0, external=3.0")
+        print(f"  Never-recalled imports archived after {IMPORTED_PRUNE_SESSIONS} sessions")
         print("\nv3.1 Activation Commands (Hebbian learning inspired by Shodh-Memory):")
         print("  activated       - Show most activated memories (time-weighted retrieval)")
         print("  activation <id> - Calculate activation score for a specific memory")
@@ -1520,6 +1698,61 @@ if __name__ == "__main__":
             print(f"\n  (Activation combines weight + recall bonus, decayed by time)")
         else:
             print(f"Memory {memory_id} not found")
+    elif cmd == "promote":
+        # v3.5: Run heat promotion
+        promoted = heat_promote_memories()
+        if not promoted:
+            print(f"No memories eligible for promotion (threshold: recall_count >= {HEAT_PROMOTION_THRESHOLD})")
+    elif cmd == "trust" and len(sys.argv) > 2:
+        # v3.4: Show trust tier and decay multiplier for a memory
+        memory_id = sys.argv[2]
+        result = recall_memory(memory_id, track_cooccurrence=False)
+        if result:
+            meta, _ = result
+            tier = get_memory_trust_tier(meta)
+            mult = get_decay_multiplier(meta)
+            source = meta.get('source', {})
+            print(f"Memory: {memory_id}")
+            print(f"  Trust tier: {tier}")
+            print(f"  Decay multiplier: {mult}x")
+            print(f"  Sessions since recall: {meta.get('sessions_since_recall', 0)}")
+            print(f"  Effective sessions: {meta.get('sessions_since_recall', 0) * mult:.1f}")
+            if isinstance(source, dict) and source.get('agent'):
+                print(f"  Source agent: {source.get('agent')}")
+                print(f"  Imported at: {source.get('imported_at', 'unknown')}")
+            # Check imported tag
+            for tag in meta.get('tags', []):
+                if isinstance(tag, str) and tag.startswith('imported:'):
+                    print(f"  Import tag: {tag}")
+        else:
+            print(f"Memory {memory_id} not found")
+    elif cmd == "imported":
+        # v3.4: List all imported memories with trust tiers
+        print("Imported Memories:\n")
+        imported = []
+        for directory in [CORE_DIR, ACTIVE_DIR, ARCHIVE_DIR]:
+            if not directory.exists():
+                continue
+            for filepath in directory.glob("*.md"):
+                meta, _ = parse_memory_file(filepath)
+                tier = get_memory_trust_tier(meta)
+                if tier != 'self':
+                    imported.append((filepath, meta, tier))
+
+        if not imported:
+            print("No imported memories found.")
+        else:
+            print(f"{'ID':<12} {'Trust Tier':<16} {'Sessions':<10} {'Recalls':<8} {'Source'}")
+            print("-" * 70)
+            for fp, meta, tier in sorted(imported, key=lambda x: x[2]):
+                mem_id = meta.get('id', fp.stem)[:12]
+                sessions = meta.get('sessions_since_recall', 0)
+                recalls = meta.get('recall_count', 0)
+                source = meta.get('source', {})
+                agent = source.get('agent', 'unknown') if isinstance(source, dict) else 'unknown'
+                mult = DECAY_MULTIPLIERS.get(tier, 1.0)
+                print(f"{mem_id:<12} {tier:<16} {sessions:<10} {recalls:<8} {agent}")
+            print(f"\n{len(imported)} imported memories total")
     elif cmd == "migrate-v3":
         migrate_to_v3()
     elif cmd == "edges":
@@ -1552,3 +1785,65 @@ if __name__ == "__main__":
                 print(f"  [{obs.get('id', '?')[:8]}] {obs.get('observed_at', '?')}")
                 print(f"    Source: {source.get('type', '?')} | Agent: {source.get('agent', '?')}")
                 print(f"    Weight: {obs.get('weight', 0):.2f} | Trust: {obs.get('trust_tier', '?')}")
+
+    elif cmd == "store" and len(sys.argv) >= 4:
+        # Store a new memory from transcript processor or other source
+        # Usage: store <memory_id> <content> [--tags tag1,tag2,tag3]
+        mem_id = sys.argv[2]
+        content = sys.argv[3]
+
+        # Parse optional tags
+        tags = ['thought', 'auto-extracted']
+        for i, arg in enumerate(sys.argv):
+            if arg == '--tags' and i + 1 < len(sys.argv):
+                tags = sys.argv[i + 1].split(',')
+                break
+
+        # Check if memory already exists
+        for directory in [CORE_DIR, ACTIVE_DIR]:
+            if directory.exists():
+                for filepath in directory.glob("*.md"):
+                    metadata, _ = parse_memory_file(filepath)
+                    if metadata.get('id') == mem_id:
+                        print(f"Memory {mem_id} already exists, skipping")
+                        sys.exit(0)
+
+        # Create new memory file
+        metadata = {
+            'id': mem_id,
+            'created': datetime.now(timezone.utc).isoformat(),
+            'type': 'active',
+            'tags': tags,
+            'emotional_weight': 0.5,
+            'recall_count': 0,
+            'sessions_since_recall': 0,
+            'source': {
+                'type': 'transcript_extraction',
+                'agent': 'SpindriftMend',
+            }
+        }
+
+        ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
+        safe_id = mem_id.replace(':', '-').replace('/', '-')
+        filepath = ACTIVE_DIR / f"{safe_id}.md"
+
+        write_memory_file(filepath, metadata, f"# {mem_id}\n\n{content}")
+        print(f"Stored: {mem_id} -> {filepath.name}")
+
+        # Auto-index for semantic search (unless --no-index flag present)
+        if '--no-index' not in sys.argv:
+            try:
+                import subprocess
+                semantic_search = MEMORY_ROOT / "semantic_search.py"
+                if semantic_search.exists():
+                    result = subprocess.run(
+                        ["python", str(semantic_search), "index"],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        cwd=str(MEMORY_ROOT)
+                    )
+                    if result.returncode == 0:
+                        print("Auto-indexed for semantic search")
+            except Exception as e:
+                pass  # Indexing is non-critical
