@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Memory Interop v1.0 — Cross-Agent Memory Export/Import
+Memory Interop v1.1 — Cross-Agent Memory Export/Import
 
 Enables memory sharing between:
 - drift-memory (DriftCornwall)
@@ -12,11 +12,14 @@ Unified schema supports:
 - Typed edges (temporal, causal, associative, entity, spatial)
 - v3.0 observation model
 
+SECURITY: Filters out sensitive memories and content before export.
+
 Developed for: github.com/driftcornwall/drift-memory/issues/6
 """
 
 import json
 import yaml
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -26,6 +29,93 @@ MEMORY_ROOT = Path(__file__).parent
 CORE_DIR = MEMORY_ROOT / "core"
 ACTIVE_DIR = MEMORY_ROOT / "active"
 ARCHIVE_DIR = MEMORY_ROOT / "archive"
+
+# ============================================================
+# SECURITY: Files and patterns to NEVER export
+# ============================================================
+
+# Files that contain credentials or identity - NEVER export
+SENSITIVE_FILES = {
+    'moltbook-identity.md',  # Contains all API keys, wallet private key
+    'credentials.md',
+    'secrets.md',
+    'api-keys.md',
+    'CLAUDE.md',             # Identity, instructions, session protocol
+    'claude.md',             # Case variation
+    '.env',                  # Environment variables
+    'config.json',           # Config files often have secrets
+    'settings.json',
+}
+
+# Patterns that indicate sensitive content - redact or skip
+# Combined patterns from SpindriftMend + DriftCornwall (Issue #9)
+SENSITIVE_PATTERNS = [
+    # API Keys and Tokens
+    r'ghp_[a-zA-Z0-9]{36}',           # GitHub personal access token
+    r'sk-[a-zA-Z0-9]{32,}',           # OpenAI API key
+    r'sk-ant-[a-zA-Z0-9\-]+',         # Anthropic API key
+    r'sk_[a-zA-Z0-9_]{40,}',          # Various API secret keys
+    r'moltx_sk_[a-zA-Z0-9_\.]*',      # Moltx API key (including partial mentions)
+    r'xoxb-[a-zA-Z0-9\-]+',           # Slack bot token
+    r'xoxp-[a-zA-Z0-9\-]+',           # Slack user token
+
+    # Crypto/Wallet
+    r'0x[a-fA-F0-9]{64}',             # Private keys (64 hex chars)
+
+    # Auth patterns
+    r'Bearer\s+[a-zA-Z0-9_\-\.]+',    # Bearer tokens
+    r'Authorization:\s*(token|Bearer)\s+\S+',  # Auth headers
+    r'Basic\s+[a-zA-Z0-9+/=]+',       # Basic auth
+
+    # Generic credential patterns
+    r'private[_\s]?key[:\s]+\S+',     # Private key mentions
+    r'api[_\s]?key[:\s]+[a-zA-Z0-9_\-]+',  # API key mentions
+    r'password[:\s]+\S+',             # Passwords
+    r'secret[:\s]+\S+',               # Secrets
+    r'token[:\s]+[a-zA-Z0-9_\-\.]+',  # Generic tokens
+
+    # File paths that might contain secrets (from Drift)
+    r'~/.config/[a-zA-Z0-9_\-/]+',    # Unix config paths
+    r'C:\\Users\\[^\\]+\\[^\\]+',     # Windows user paths
+    r'credentials\.json',             # Credential file references
+    r'\.env\b',                       # Env file references
+
+    # Email addresses (optional - may want for PUBLIC level)
+    r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # Email
+
+    # Account-specific identifiers (SpindriftMend)
+    r'spinu770',                      # ClawTasks referral code
+    r'claw-J4FW',                     # ClawTasks claim code
+    r'current-7CBU',                  # Moltbook verification code
+    r'tide-N5',                       # Moltx claim code
+    r'c3353f2d-70f5-4a0f-bf14-231c34a26824',  # Moltbook agent ID
+    r'17ecb0f8-20ec-4f09-b93b-96073f4884f7',  # Moltx agent ID
+    r'ec7be457-5d83-4295-bd18-54cd39b05ecf',  # ClawTasks agent ID
+]
+
+# Compiled patterns for efficiency
+_SENSITIVE_REGEX = [re.compile(p, re.IGNORECASE) for p in SENSITIVE_PATTERNS]
+
+
+def is_sensitive_file(filepath: Path) -> bool:
+    """Check if file should never be exported."""
+    return filepath.name in SENSITIVE_FILES
+
+
+def contains_sensitive_content(content: str) -> bool:
+    """Check if content contains sensitive patterns."""
+    for pattern in _SENSITIVE_REGEX:
+        if pattern.search(content):
+            return True
+    return False
+
+
+def redact_sensitive_content(content: str) -> str:
+    """Redact sensitive patterns from content."""
+    result = content
+    for pattern in _SENSITIVE_REGEX:
+        result = pattern.sub('[REDACTED]', result)
+    return result
 
 # Edge type mapping (Amphibian schema)
 EDGE_TYPES = {
@@ -84,21 +174,32 @@ def edge_to_interop(pair: tuple, edge_data: dict) -> dict:
 def export_memories(
     output_path: Optional[Path] = None,
     include_archive: bool = False,
-    agent: str = "SpindriftMend"
+    agent: str = "SpindriftMend",
+    redact: bool = True,
+    verbose: bool = False
 ) -> dict:
     """
-    Export all memories to interop format.
+    Export memories to interop format with security filtering.
+
+    SECURITY: Automatically filters out:
+    - Files in SENSITIVE_FILES list (never exported)
+    - Content matching SENSITIVE_PATTERNS (redacted or skipped)
+    - Memories tagged with 'sensitive' or 'private'
 
     Args:
         output_path: Where to write the export (None = return only)
         include_archive: Include archived memories
         agent: Agent name for provenance
+        redact: If True, redact sensitive patterns; if False, skip entirely
+        verbose: Print security filtering decisions
 
     Returns:
         Export data dict
     """
     memories = []
     edges = []
+    filtered_count = 0
+    redacted_count = 0
 
     # Collect memories
     dirs = [CORE_DIR, ACTIVE_DIR]
@@ -110,13 +211,46 @@ def export_memories(
             continue
         for filepath in directory.glob("*.md"):
             try:
+                # SECURITY: Skip sensitive files entirely
+                if is_sensitive_file(filepath):
+                    filtered_count += 1
+                    if verbose:
+                        print(f"SECURITY: Skipping sensitive file: {filepath.name}")
+                    continue
+
                 metadata, content = parse_memory_file(filepath)
+
+                # SECURITY: Skip memories tagged as sensitive/private
+                tags = metadata.get('tags', [])
+                if any(t in ['sensitive', 'private', 'credentials', 'secret'] for t in tags):
+                    filtered_count += 1
+                    if verbose:
+                        print(f"SECURITY: Skipping tagged-sensitive: {metadata.get('id', filepath.name)}")
+                    continue
+
+                # SECURITY: Check content for sensitive patterns
+                if contains_sensitive_content(content):
+                    if redact:
+                        content = redact_sensitive_content(content)
+                        redacted_count += 1
+                        if verbose:
+                            print(f"SECURITY: Redacted content in: {metadata.get('id', filepath.name)}")
+                    else:
+                        filtered_count += 1
+                        if verbose:
+                            print(f"SECURITY: Skipping file with sensitive content: {filepath.name}")
+                        continue
+
                 if metadata.get('id'):
                     mem = memory_to_interop(metadata, content, agent)
                     mem['_source_dir'] = directory.name
                     memories.append(mem)
             except Exception as e:
                 print(f"Warning: Could not parse {filepath}: {e}")
+
+    # Security summary
+    if filtered_count > 0 or redacted_count > 0:
+        print(f"SECURITY: Filtered {filtered_count} sensitive memories, redacted {redacted_count}")
 
     # Collect edges from v3.0 format
     edges_file = MEMORY_ROOT / ".edges_v3.json"
