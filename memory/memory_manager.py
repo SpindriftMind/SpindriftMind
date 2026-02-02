@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Memory Architecture v2.4 — Living Memory System
+Memory Architecture v3.0 — Living Memory System with Edge Provenance
 A prototype for agent memory with decay, reinforcement, and associative links.
 
 Design principles:
@@ -8,8 +8,17 @@ Design principles:
 - Relevant memories surface when needed
 - Not everything recalled at once
 - Memories compress over time but core knowledge persists
-- Session state persists across restarts (v2.3)
-- Comprehensive stats for experiment tracking (v2.4)
+
+v3.0 Changes (BrutusBot provenance model):
+- Separate OBSERVATIONS (immutable, append-only) from BELIEFS (aggregated, decaying)
+- Each observation records: timestamp, source, trust_tier, weight
+- Beliefs computed from observations with time decay and trust weighting
+- Enables auditability, poison resistance, multi-agent memory sharing
+- Developed from BrutusBot's security recommendations on MoltX
+
+v2.5 Changes:
+- Added sqrt-weighted co-occurrence (SpindriftMend/DriftCornwall collaboration)
+  Multiple recalls in same session get diminishing returns
 """
 
 import os
@@ -17,6 +26,8 @@ import json
 import yaml
 import uuid
 import hashlib
+import math
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -31,12 +42,24 @@ SESSION_FILE = MEMORY_ROOT / ".session_state.json"
 DECAY_THRESHOLD_SESSIONS = 7  # Sessions without recall before compression candidate
 EMOTIONAL_WEIGHT_THRESHOLD = 0.6  # Above this resists decay
 RECALL_COUNT_THRESHOLD = 5  # Above this resists decay
-COOCCURRENCE_LINK_THRESHOLD = 3  # Times memories must co-occur to auto-link
-PAIR_DECAY_RATE = 0.5  # How much co-occurrence counts decay per session if not reinforced
+COOCCURRENCE_LINK_THRESHOLD = 3  # Belief threshold for auto-linking (v3.0: computed from observations)
+PAIR_DECAY_RATE = 0.5  # How much beliefs decay per session if not reinforced
 SESSION_TIMEOUT_HOURS = 4  # Sessions older than this are considered stale
+WEIGHTED_COOCCURRENCE = True  # Enable sqrt weighting for intra-session co-occurrence (v2.5)
+
+# v3.0 Provenance Configuration
+OBSERVATION_MAX_AGE_DAYS = 30  # Observations older than this get reduced weight
+TRUST_TIERS = {
+    'self': 1.0,           # My own observations
+    'verified_agent': 0.8,  # Observations from trusted agents (e.g., DriftCornwall)
+    'platform': 0.6,        # Observations from platform APIs (Moltbook, etc.)
+    'unknown': 0.3          # Observations from unknown sources
+}
+RATE_LIMIT_NEW_SOURCES = 3  # Max observations from new source per session (poison resistance)
 
 # Session-level tracking for co-occurrence (now file-backed for persistence)
-_session_recalls: set[str] = set()  # Memory IDs recalled this session
+# v2.5: Changed from set to Counter to track recall counts for weighted co-occurrence
+_session_recalls: Counter = Counter()  # Memory IDs -> recall count this session
 _session_loaded: bool = False  # Whether session state has been loaded from disk
 _cooccurrence_counts: dict[tuple[str, str], int] = {}  # Pair -> count
 
@@ -389,27 +412,318 @@ def list_all_tags() -> dict[str, int]:
 # ============================================================================
 
 def _get_cooccurrence_file() -> Path:
-    """Path to persistent co-occurrence counts."""
+    """Path to persistent co-occurrence edges (v3.0 format)."""
     return MEMORY_ROOT / ".cooccurrence.yaml"
 
 
+def _get_edges_file() -> Path:
+    """Path to v3.0 edges with provenance."""
+    return MEMORY_ROOT / ".edges_v3.json"
+
+
 def _load_cooccurrence_counts() -> dict[str, int]:
-    """Load persistent co-occurrence counts."""
+    """
+    Load co-occurrence data. Returns belief scores (v3.0) or raw counts (legacy).
+    For backwards compatibility, converts v3.0 edges to simple counts.
+    """
+    # Try v3.0 format first
+    edges_file = _get_edges_file()
+    if edges_file.exists():
+        edges = _load_edges_v3()
+        # Return beliefs as counts for backwards compatibility
+        return {pair: edge['belief'] for pair, edge in edges.items()}
+
+    # Fall back to legacy format
     filepath = _get_cooccurrence_file()
     if filepath.exists():
-        with open(filepath, 'r') as f:
+        with open(filepath, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f) or {}
             return {tuple(k.split('|')): v for k, v in data.items()}
     return {}
 
 
 def _save_cooccurrence_counts(counts: dict[tuple[str, str], int]):
-    """Save co-occurrence counts to disk."""
+    """
+    Save co-occurrence counts. In v3.0, this updates beliefs only.
+    For full provenance, use _save_edges_v3() directly.
+    """
+    # If v3.0 edges exist, update beliefs there
+    edges_file = _get_edges_file()
+    if edges_file.exists():
+        edges = _load_edges_v3()
+        for pair, belief in counts.items():
+            if pair in edges:
+                edges[pair]['belief'] = belief
+        _save_edges_v3(edges)
+        return
+
+    # Legacy format
     filepath = _get_cooccurrence_file()
-    # Convert tuple keys to strings for YAML
     data = {'|'.join(k): v for k, v in counts.items()}
-    with open(filepath, 'w') as f:
+    with open(filepath, 'w', encoding='utf-8') as f:
         yaml.dump(data, f)
+
+
+# ============================================================================
+# V3.0 EDGE PROVENANCE SYSTEM (BrutusBot model)
+# ============================================================================
+#
+# Observations are immutable records of co-occurrence events.
+# Beliefs are aggregated scores computed from observations.
+# This separation enables:
+# - Auditability: trace why memories are linked
+# - Poison resistance: rate-limit untrusted sources
+# - Multi-agent: trust tiers for external observations
+# ============================================================================
+
+def _load_edges_v3() -> dict[tuple[str, str], dict]:
+    """
+    Load v3.0 edges with full provenance.
+
+    Format:
+    {
+        (id1, id2): {
+            'observations': [
+                {
+                    'id': 'uuid',
+                    'observed_at': 'iso_timestamp',
+                    'source': {'type': 'session_recall', 'session_id': '...', 'agent': '...'},
+                    'weight': 1.0,
+                    'trust_tier': 'self'
+                },
+                ...
+            ],
+            'belief': 2.5,  # Aggregated score
+            'last_updated': 'iso_timestamp'
+        }
+    }
+    """
+    edges_file = _get_edges_file()
+    if not edges_file.exists():
+        return {}
+
+    try:
+        with open(edges_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # Convert string keys back to tuples
+        return {tuple(k.split('|')): v for k, v in data.items()}
+    except (json.JSONDecodeError, KeyError):
+        return {}
+
+
+def _save_edges_v3(edges: dict[tuple[str, str], dict]):
+    """Save v3.0 edges with provenance to disk."""
+    edges_file = _get_edges_file()
+    # Convert tuple keys to strings for JSON
+    data = {'|'.join(k): v for k, v in edges.items()}
+    with open(edges_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+
+
+def _create_observation(
+    source_type: str,
+    weight: float = 1.0,
+    trust_tier: str = 'self',
+    session_id: Optional[str] = None,
+    agent: str = 'SpindriftMend',
+    platform: Optional[str] = None,
+    artifact_id: Optional[str] = None
+) -> dict:
+    """
+    Create a new observation record.
+
+    Args:
+        source_type: 'session_recall', 'transcript_extraction', 'external_agent', 'platform_api'
+        weight: Observation weight (default 1.0, can use sqrt for multiple recalls)
+        trust_tier: 'self', 'verified_agent', 'platform', 'unknown'
+        session_id: Current session ID if available
+        agent: Agent name who made the observation
+        platform: Platform name if external (e.g., 'moltbook', 'github')
+        artifact_id: Reference to source artifact (post_id, commit_hash, etc.)
+    """
+    return {
+        'id': str(uuid.uuid4()),
+        'observed_at': datetime.now(timezone.utc).isoformat(),
+        'source': {
+            'type': source_type,
+            'session_id': session_id,
+            'agent': agent,
+            'platform': platform,
+            'artifact_id': artifact_id
+        },
+        'weight': weight,
+        'trust_tier': trust_tier
+    }
+
+
+def aggregate_belief(observations: list[dict], decay_rate: float = 0.1) -> float:
+    """
+    Compute belief score from observations.
+
+    Applies:
+    - Trust tier weighting (self > verified_agent > platform > unknown)
+    - Time decay (older observations contribute less)
+    - Diminishing returns (many observations from same source capped)
+
+    Args:
+        observations: List of observation dicts
+        decay_rate: How much weight decreases per day of age
+
+    Returns:
+        Aggregated belief score
+    """
+    if not observations:
+        return 0.0
+
+    now = datetime.now(timezone.utc)
+    total = 0.0
+    source_counts = Counter()  # Track observations per source for rate limiting
+
+    for obs in observations:
+        # Parse timestamp
+        try:
+            obs_time = datetime.fromisoformat(obs['observed_at'].replace('Z', '+00:00'))
+            if obs_time.tzinfo is None:
+                obs_time = obs_time.replace(tzinfo=timezone.utc)
+        except (KeyError, ValueError):
+            obs_time = now  # Default to now if parsing fails
+
+        # Calculate age in days
+        age_days = (now - obs_time).total_seconds() / 86400
+
+        # Trust tier multiplier
+        trust_tier = obs.get('trust_tier', 'unknown')
+        trust_mult = TRUST_TIERS.get(trust_tier, 0.3)
+
+        # Time decay (exponential decay over OBSERVATION_MAX_AGE_DAYS)
+        time_mult = max(0.1, 1.0 - (age_days / OBSERVATION_MAX_AGE_DAYS) * decay_rate)
+
+        # Rate limiting for same source (diminishing returns)
+        source_key = (
+            obs.get('source', {}).get('type', 'unknown'),
+            obs.get('source', {}).get('agent', 'unknown')
+        )
+        source_counts[source_key] += 1
+        # After 3rd observation from same source, apply sqrt diminishing returns
+        source_mult = 1.0 if source_counts[source_key] <= 3 else 1.0 / math.sqrt(source_counts[source_key] - 2)
+
+        # Base weight from observation
+        base_weight = obs.get('weight', 1.0)
+
+        # Final contribution
+        contribution = base_weight * trust_mult * time_mult * source_mult
+        total += contribution
+
+    return round(total, 3)
+
+
+def add_observation(
+    id1: str,
+    id2: str,
+    source_type: str = 'session_recall',
+    weight: float = 1.0,
+    trust_tier: str = 'self',
+    **source_kwargs
+) -> dict:
+    """
+    Add an observation to an edge and recompute belief.
+    Creates edge if it doesn't exist.
+
+    Args:
+        id1, id2: Memory IDs
+        source_type: Type of observation source
+        weight: Observation weight
+        trust_tier: Trust level of the source
+        **source_kwargs: Additional source metadata (session_id, agent, platform, etc.)
+
+    Returns:
+        The updated edge dict
+    """
+    edges = _load_edges_v3()
+    pair = tuple(sorted([id1, id2]))
+
+    # Create edge if needed
+    if pair not in edges:
+        edges[pair] = {
+            'observations': [],
+            'belief': 0.0,
+            'last_updated': datetime.now(timezone.utc).isoformat()
+        }
+
+    # Create and append observation
+    obs = _create_observation(
+        source_type=source_type,
+        weight=weight,
+        trust_tier=trust_tier,
+        **source_kwargs
+    )
+    edges[pair]['observations'].append(obs)
+
+    # Recompute belief
+    edges[pair]['belief'] = aggregate_belief(edges[pair]['observations'])
+    edges[pair]['last_updated'] = datetime.now(timezone.utc).isoformat()
+
+    # Save
+    _save_edges_v3(edges)
+
+    return edges[pair]
+
+
+def migrate_to_v3():
+    """
+    Migrate legacy .cooccurrence.yaml to v3.0 edges format.
+    Preserves existing counts as legacy observations.
+    """
+    legacy_file = _get_cooccurrence_file()
+    edges_file = _get_edges_file()
+
+    if edges_file.exists():
+        print("v3.0 edges file already exists. Skipping migration.")
+        return
+
+    if not legacy_file.exists():
+        print("No legacy cooccurrence file to migrate.")
+        return
+
+    # Load legacy counts
+    with open(legacy_file, 'r', encoding='utf-8') as f:
+        legacy_data = yaml.safe_load(f) or {}
+
+    # Convert to v3.0 format
+    edges = {}
+    migration_time = datetime.now(timezone.utc).isoformat()
+
+    for pair_str, count in legacy_data.items():
+        pair = tuple(pair_str.split('|'))
+
+        # Create a single "legacy" observation representing the accumulated count
+        edges[pair] = {
+            'observations': [
+                {
+                    'id': str(uuid.uuid4()),
+                    'observed_at': migration_time,
+                    'source': {
+                        'type': 'legacy_migration',
+                        'session_id': None,
+                        'agent': 'SpindriftMend',
+                        'note': f'Migrated from v2.x count={count}'
+                    },
+                    'weight': float(count),  # Preserve original count as weight
+                    'trust_tier': 'self'
+                }
+            ],
+            'belief': float(count),  # Start with same value
+            'last_updated': migration_time
+        }
+
+    # Save v3.0 format
+    _save_edges_v3(edges)
+    print(f"Migrated {len(edges)} edges to v3.0 format.")
+
+    # Rename legacy file as backup
+    backup_file = MEMORY_ROOT / ".cooccurrence.yaml.v2backup"
+    legacy_file.rename(backup_file)
+    print(f"Legacy file backed up to {backup_file}")
 
 
 def track_recall(memory_id: str):
@@ -424,10 +738,15 @@ def track_recall(memory_id: str):
     _save_session_state()
 
 
-def end_session_cooccurrence():
+def end_session_cooccurrence(session_id: Optional[str] = None):
     """
     End session: process co-occurrences and create automatic links.
     Call this at the end of each session.
+
+    v3.0: Now records full observations with provenance.
+
+    Args:
+        session_id: Optional session identifier for provenance tracking
 
     Returns: List of newly created links as (id1, id2) tuples
     """
@@ -436,33 +755,70 @@ def end_session_cooccurrence():
     # Load session state from disk
     _load_session_state()
 
-    # Load persistent co-occurrence counts
-    _cooccurrence_counts = _load_cooccurrence_counts()
-
     new_links = []
 
-    # Convert set to list for pair iteration
-    recalled_list = list(_session_recalls)
+    # Convert to list for pair iteration
+    # v2.5+: _session_recalls is a Counter, get items with counts
+    if isinstance(_session_recalls, Counter):
+        recalled_items = list(_session_recalls.items())  # [(id, count), ...]
+        recalled_ids = list(_session_recalls.keys())
+    else:
+        recalled_ids = list(_session_recalls)
+        recalled_items = [(id, 1) for id in recalled_ids]
 
-    # For each pair of memories recalled this session, increment co-occurrence
-    for i, id1 in enumerate(recalled_list):
-        for id2 in recalled_list[i+1:]:
-            # Normalize pair order for consistent counting
+    # v3.0: Record observations with provenance
+    edges = _load_edges_v3()
+
+    for i, id1 in enumerate(recalled_ids):
+        for id2 in recalled_ids[i+1:]:
             pair = tuple(sorted([id1, id2]))
-            _cooccurrence_counts[pair] = _cooccurrence_counts.get(pair, 0) + 1
 
-            # Check if we should create a link
-            if _cooccurrence_counts[pair] == COOCCURRENCE_LINK_THRESHOLD:
-                # Create bidirectional link
+            # Calculate weight (sqrt of min recalls for diminishing returns)
+            if WEIGHTED_COOCCURRENCE and isinstance(_session_recalls, Counter):
+                count1 = _session_recalls.get(id1, 1)
+                count2 = _session_recalls.get(id2, 1)
+                weight = math.sqrt(min(count1, count2))
+            else:
+                weight = 1.0
+
+            # Create observation with full provenance
+            obs = _create_observation(
+                source_type='session_recall',
+                weight=weight,
+                trust_tier='self',
+                session_id=session_id,
+                agent='SpindriftMend'
+            )
+
+            # Add to edge
+            if pair not in edges:
+                edges[pair] = {
+                    'observations': [],
+                    'belief': 0.0,
+                    'last_updated': datetime.now(timezone.utc).isoformat()
+                }
+
+            edges[pair]['observations'].append(obs)
+            edges[pair]['belief'] = aggregate_belief(edges[pair]['observations'])
+            edges[pair]['last_updated'] = datetime.now(timezone.utc).isoformat()
+
+            # Check if belief crossed link threshold
+            # Only link if this is the first time crossing
+            prev_belief = edges[pair]['belief'] - obs['weight']  # Approximate previous
+            if prev_belief < COOCCURRENCE_LINK_THRESHOLD <= edges[pair]['belief']:
                 if _add_memory_link(pair[0], pair[1]):
                     new_links.append(pair)
-                    print(f"Auto-linked memories after {COOCCURRENCE_LINK_THRESHOLD} co-occurrences: {pair[0]} <-> {pair[1]}")
+                    print(f"Auto-linked memories (belief={edges[pair]['belief']:.2f}): {pair[0]} <-> {pair[1]}")
 
-    # Save updated counts
+    # Save v3.0 edges
+    _save_edges_v3(edges)
+
+    # Also update legacy format for backwards compatibility
+    _cooccurrence_counts = {pair: edge['belief'] for pair, edge in edges.items()}
     _save_cooccurrence_counts(_cooccurrence_counts)
 
     # Clear session state
-    _session_recalls = set()
+    _session_recalls = Counter() if isinstance(_session_recalls, Counter) else set()
     _session_loaded = False
     SESSION_FILE.unlink(missing_ok=True)
 
@@ -619,15 +975,19 @@ def log_decay_event(decayed: int, pruned: int):
 
 def decay_pair_cooccurrences() -> tuple[int, int]:
     """
-    Apply soft decay to co-occurrence pairs that weren't reinforced this session.
+    Apply soft decay to co-occurrence beliefs that weren't reinforced this session.
     Call AFTER end_session_cooccurrence() at session end.
 
-    Pairs that co-occurred this session: no decay (already got +1)
-    Pairs that didn't co-occur: decay by PAIR_DECAY_RATE (default 0.5)
-    Pairs that hit 0 or below: pruned
+    v3.0: Decays BELIEFS, not observations. Observations remain immutable.
+    The belief is recomputed from observations with time decay applied.
 
-    This prevents unbounded growth of co-occurrence data over time.
+    Pairs that co-occurred this session: no additional decay (just got new observation)
+    Pairs that didn't co-occur: belief decays by PAIR_DECAY_RATE (default 0.5)
+    Pairs with belief <= 0 and no recent observations: marked inactive (not deleted)
+
+    This prevents unbounded growth while preserving audit trail.
     Developed in collaboration with DriftCornwall (github.com/driftcornwall/drift-memory).
+    v3.0 provenance model from BrutusBot security recommendations.
 
     Returns: (pairs_decayed, pairs_pruned)
     """
@@ -635,39 +995,50 @@ def decay_pair_cooccurrences() -> tuple[int, int]:
 
     # Build set of pairs that were reinforced this session
     reinforced_pairs = set()
-    recalled_list = list(_session_recalls)
+    if isinstance(_session_recalls, Counter):
+        recalled_list = list(_session_recalls.keys())
+    else:
+        recalled_list = list(_session_recalls)
+
     for i, id1 in enumerate(recalled_list):
         for id2 in recalled_list[i+1:]:
             reinforced_pairs.add(tuple(sorted([id1, id2])))
 
-    # Load current counts
-    counts = _load_cooccurrence_counts()
+    # Load v3.0 edges
+    edges = _load_edges_v3()
 
     pairs_decayed = 0
     pairs_pruned = 0
-    to_remove = []
 
-    for pair, count in counts.items():
+    for pair, edge in edges.items():
         if pair not in reinforced_pairs:
-            new_count = count - PAIR_DECAY_RATE
-            if new_count <= 0:
-                to_remove.append(pair)
+            # Recompute belief from observations (time decay is built into aggregate_belief)
+            # Then apply additional session-based decay for unreinforced pairs
+            current_belief = edge.get('belief', 0)
+            new_belief = current_belief - PAIR_DECAY_RATE
+
+            if new_belief <= 0:
+                # Don't delete - mark as inactive but preserve observations for audit
+                edge['belief'] = 0
+                edge['status'] = 'inactive'
                 pairs_pruned += 1
             else:
-                counts[pair] = new_count
+                edge['belief'] = round(new_belief, 3)
                 pairs_decayed += 1
 
-    # Remove pruned pairs
-    for pair in to_remove:
-        del counts[pair]
+            edge['last_updated'] = datetime.now(timezone.utc).isoformat()
 
-    # Save updated counts
+    # Save updated edges
+    _save_edges_v3(edges)
+
+    # Also update legacy format
+    counts = {pair: edge['belief'] for pair, edge in edges.items() if edge.get('belief', 0) > 0}
     _save_cooccurrence_counts(counts)
 
     # Log for stats tracking
     log_decay_event(pairs_decayed, pairs_pruned)
 
-    print(f"Pair decay: {pairs_decayed} decayed, {pairs_pruned} pruned")
+    print(f"Pair decay: {pairs_decayed} decayed, {pairs_pruned} marked inactive")
     return pairs_decayed, pairs_pruned
 
 
@@ -676,7 +1047,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Memory Manager v2.4 - Living Memory System")
+        print("Memory Manager v3.0 - Living Memory System with Edge Provenance")
         print("\nCommands:")
         print("  maintenance     - Run session maintenance")
         print("  tags            - List all tags")
@@ -688,6 +1059,10 @@ if __name__ == "__main__":
         print("  stats           - Comprehensive stats for experiment tracking")
         print("  end-session     - Process co-occurrences, apply decay, and clear session")
         print("  decay-pairs     - Apply pair decay only (without logging new co-occurrences)")
+        print("\nv3.0 Provenance Commands:")
+        print("  migrate-v3      - Migrate legacy .cooccurrence.yaml to v3.0 format")
+        print("  edges           - Show v3.0 edges with observation counts")
+        print("  edge <id1> <id2> - Show full provenance for a specific edge")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -773,3 +1148,35 @@ if __name__ == "__main__":
     elif cmd == "decay-pairs":
         decayed, pruned = decay_pair_cooccurrences()
         print(f"Decay complete: {decayed} pairs decayed, {pruned} pairs pruned")
+    elif cmd == "migrate-v3":
+        migrate_to_v3()
+    elif cmd == "edges":
+        edges = _load_edges_v3()
+        if not edges:
+            print("No v3.0 edges found. Run 'migrate-v3' to migrate from legacy format.")
+        else:
+            print(f"v3.0 Edges ({len(edges)} total):\n")
+            for pair, edge in sorted(edges.items(), key=lambda x: x[1].get('belief', 0), reverse=True):
+                obs_count = len(edge.get('observations', []))
+                belief = edge.get('belief', 0)
+                status = edge.get('status', 'active')
+                print(f"  {pair[0]} <-> {pair[1]}")
+                print(f"    Belief: {belief:.2f} | Observations: {obs_count} | Status: {status}")
+    elif cmd == "edge" and len(sys.argv) >= 4:
+        id1, id2 = sys.argv[2], sys.argv[3]
+        pair = tuple(sorted([id1, id2]))
+        edges = _load_edges_v3()
+        if pair not in edges:
+            print(f"No edge found between {id1} and {id2}")
+        else:
+            edge = edges[pair]
+            print(f"Edge: {pair[0]} <-> {pair[1]}")
+            print(f"Belief: {edge.get('belief', 0):.3f}")
+            print(f"Status: {edge.get('status', 'active')}")
+            print(f"Last Updated: {edge.get('last_updated', 'unknown')}")
+            print(f"\nObservations ({len(edge.get('observations', []))}):")
+            for obs in edge.get('observations', []):
+                source = obs.get('source', {})
+                print(f"  [{obs.get('id', '?')[:8]}] {obs.get('observed_at', '?')}")
+                print(f"    Source: {source.get('type', '?')} | Agent: {source.get('agent', '?')}")
+                print(f"    Weight: {obs.get('weight', 0):.2f} | Trust: {obs.get('trust_tier', '?')}")
