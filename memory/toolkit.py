@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SpindriftMend Unified Memory Toolkit v1.0
+SpindriftMend Unified Memory Toolkit v1.1
 
 Single entry point for all memory system operations.
 Consolidates 30+ individual tools into one CLI.
@@ -27,7 +27,7 @@ from pathlib import Path
 MEMORY_ROOT = Path(__file__).parent
 TOOLKIT_CONFIG = {
     "agent_name": "SpindriftMend",
-    "version": "1.0",
+    "version": "1.1",
     "social_dir": "social",
     "synonym_module": "synonym_bridge",
     "has_reciprocity": True,
@@ -142,6 +142,12 @@ def build_registry():
         Command("import", "memory", "Import with quarantine", "memory_interop", "import"),
         Command("graph-export", "memory", "Export graph snapshot", "graph_compare", "export"),
         Command("graph-compare", "memory", "Compare graph snapshots", "graph_compare", "compare", "<file1> <file2>"),
+        # Lesson system
+        Command("lessons", "memory", "List all lessons", "lesson_extractor", "list"),
+        Command("lesson-stats", "memory", "Lesson statistics", "lesson_extractor", "stats"),
+        Command("lesson-add", "memory", "Add a lesson manually", "lesson_extractor", "add", "<category> \"<lesson>\""),
+        Command("lesson-mine", "memory", "Mine lessons from MEMORY.md", "lesson_extractor", "mine-memory"),
+        Command("lesson-apply", "memory", "Find applicable lessons", "lesson_extractor", "apply", "\"<situation>\""),
     ]
 
     registry = {}
