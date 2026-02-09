@@ -322,6 +322,105 @@ def apply_lessons(situation):
     return [l for _, l in scored[:5]]
 
 
+def get_priming_lessons(context_keywords=None, max_lessons=5):
+    """Return lessons formatted for session priming injection.
+
+    Called by session_start.py to surface relevant lessons at wake-up.
+    If context_keywords provided, scores by relevance. Otherwise returns
+    highest-confidence lessons that haven't been recalled recently.
+    """
+    lessons = load_lessons()
+    if not lessons:
+        return ""
+
+    if context_keywords:
+        # Score by keyword overlap
+        keywords_lower = set(w.lower() for w in context_keywords)
+        scored = []
+        for lesson in lessons:
+            lesson_words = set(lesson['lesson'].lower().split())
+            overlap = len(keywords_lower & lesson_words)
+            score = overlap * 0.1 + lesson.get('confidence', 0.5) * 0.2
+            if overlap > 0:
+                scored.append((score, lesson))
+        scored.sort(key=lambda x: -x[0])
+        selected = [l for _, l in scored[:max_lessons]]
+    else:
+        # Return highest-confidence, least-recalled lessons
+        sorted_lessons = sorted(lessons, key=lambda l: (
+            -l.get('confidence', 0),
+            l.get('recalled_count', 0)
+        ))
+        selected = sorted_lessons[:max_lessons]
+
+    if not selected:
+        return ""
+
+    # Format for context injection
+    lines = ["=== ACTIVE LESSONS (heuristics from experience) ==="]
+    for lesson in selected:
+        cat = lesson.get('category', '?')
+        text = lesson['lesson'][:150]
+        lines.append(f"  [{cat}] {text}")
+
+    # Update recall counts
+    for lesson in selected:
+        lesson['recalled_count'] = lesson.get('recalled_count', 0) + 1
+        lesson['last_recalled'] = datetime.now(timezone.utc).isoformat()
+    save_lessons(lessons)
+
+    return "\n".join(lines)
+
+
+def get_contextual_lessons(situation, max_lessons=3):
+    """Return lessons matching a situation, formatted for context injection.
+
+    Use this when something goes wrong (API error, unexpected behavior)
+    to surface relevant heuristics without CLI output.
+    Returns a string suitable for injecting into agent context.
+    """
+    lessons = load_lessons()
+    if not lessons:
+        return ""
+
+    situation_lower = situation.lower()
+    situation_words = set(situation_lower.split())
+
+    scored = []
+    for lesson in lessons:
+        lesson_lower = lesson['lesson'].lower()
+        lesson_words = set(lesson_lower.split())
+        overlap = situation_words & lesson_words
+        score = len(overlap) * 0.1
+
+        for cat_name in CATEGORIES:
+            if cat_name in situation_lower and cat_name == lesson['category']:
+                score += 0.3
+
+        score *= lesson.get('confidence', 0.5)
+        if score > 0:
+            scored.append((score, lesson))
+
+    scored.sort(key=lambda x: -x[0])
+    selected = [l for _, l in scored[:max_lessons]]
+
+    if not selected:
+        return ""
+
+    lines = [f"[LESSON TRIGGERED] Relevant heuristics for: {situation[:60]}"]
+    for lesson in selected:
+        cat = lesson.get('category', '?')
+        text = lesson['lesson'][:200]
+        lines.append(f"  [{cat}] {text}")
+
+    for lesson in selected:
+        lesson['recalled_count'] = lesson.get('recalled_count', 0) + 1
+        lesson['last_recalled'] = datetime.now(timezone.utc).isoformat()
+    save_lessons(lessons)
+
+    return "\n".join(lines)
+
+
 def cmd_list():
     """List all lessons."""
     lessons = load_lessons()
@@ -429,6 +528,22 @@ if __name__ == '__main__':
         extracted = mine_hubs()
         print(f'\nExtracted {len(extracted)} new lessons')
 
+    elif args[0] == 'prime':
+        # For session_start.py hook — outputs formatted lessons for context injection
+        keywords = args[1:] if len(args) > 1 else None
+        output = get_priming_lessons(context_keywords=keywords, max_lessons=5)
+        if output:
+            print(output)
+
+    elif args[0] == 'contextual':
+        # For error-triggered injection — outputs lessons matching a situation
+        if len(args) < 2:
+            print('Usage: contextual "<situation description>"')
+            sys.exit(1)
+        output = get_contextual_lessons(' '.join(args[1:]))
+        if output:
+            print(output)
+
     elif args[0] == 'apply':
         if len(args) < 2:
             print('Usage: apply "<situation description>"')
@@ -437,4 +552,4 @@ if __name__ == '__main__':
 
     else:
         print(f'Unknown command: {args[0]}')
-        print('Commands: list, stats, add, mine-memory, mine-rejections, mine-hubs, apply')
+        print('Commands: list, stats, add, mine-memory, mine-rejections, mine-hubs, apply, prime, contextual')
