@@ -169,6 +169,17 @@ def collect_vitals():
     vocab = _load_json("vocabulary_map.json", {})
     m["vocabulary_terms"] = len(vocab) if isinstance(vocab, dict) else 0
 
+    # --- BRIDGE HIT RATE (v4.4) ---
+    bridge_log = _load_json(".bridge_hit_log.json", [])
+    if bridge_log:
+        m["bridge_queries"] = len(bridge_log)
+        m["bridge_hit_rate"] = round(
+            sum(e.get("hit_rate", 0) for e in bridge_log) / len(bridge_log), 3
+        ) if bridge_log else 0
+    else:
+        m["bridge_queries"] = 0
+        m["bridge_hit_rate"] = 0
+
     # --- SEARCH INDEX ---
     # embeddings.json is large (~26MB), so just check key count efficiently
     emb_file = MEMORY_ROOT / "embeddings.json"
@@ -346,14 +357,22 @@ def check_alerts():
             "values": pair_values
         })
 
-    # Special: identity drift suddenly high
+    # Special: identity drift tiered thresholds (Drift's suggestion)
+    # Natural drift is ~0.0-0.2. Biggest observed natural drift: 0.2081 (Drift, Day 7)
     drift_values = [s["metrics"].get("identity_drift", 0) for s in recent]
     drift_values = [v for v in drift_values if isinstance(v, (int, float))]
-    if drift_values and drift_values[-1] > 0.5:
+    if drift_values and drift_values[-1] > 0.15:
+        drift_val = drift_values[-1]
+        if drift_val > 0.5:
+            severity, desc = "error", "catastrophic topology change"
+        elif drift_val > 0.3:
+            severity, desc = "warn", "significant identity shift"
+        else:
+            severity, desc = "info", "notable topology change"
         alerts.append({
             "metric": "identity_drift",
-            "severity": "warn",
-            "message": f"Identity drift score {drift_values[-1]:.3f} is high (>0.5). Significant topology change.",
+            "severity": severity,
+            "message": f"Identity drift {drift_val:.3f} ({desc})",
             "values": drift_values
         })
 
@@ -424,6 +443,7 @@ def format_snapshot(snapshot, compact=False):
         "SEARCH & VOCABULARY",
         f"  Indexed memories: {m.get('search_indexed', '?')}",
         f"  Vocabulary terms: {m.get('vocabulary_terms', '?')}",
+        f"  Bridge queries: {m.get('bridge_queries', 0)} | hit rate: {m.get('bridge_hit_rate', 0):.1%}",
     ]
     return "\n".join(lines)
 
